@@ -1,0 +1,130 @@
+import express from 'express';
+import { Innertube } from 'youtubei.js';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+let youtube;
+
+async function initYoutube() {
+  try {
+    youtube = await Innertube.create();
+    console.log('YouTube.js initialized successfully.');
+  } catch (error) {
+    console.error('Failed to initialize YouTube.js:', error);
+    process.exit(1);
+  }
+}
+
+app.get('/api/channel/:id', async (req, res) => {
+  const channelId = req.params.id;
+
+  if (!youtube) {
+    return res.status(500).json({ error: 'YouTube client is not initialized.' });
+  }
+
+  try {
+    const channel = await youtube.getChannel(channelId);
+
+    let videosData = [];
+    try {
+      const videosTab = await channel.getVideos();
+      if (videosTab && videosTab.videos) {
+        videosData = videosTab.videos.map(video => ({
+          id: video.id,
+          title: video.title?.text,
+          description: video.description_snippet?.text,
+          thumbnail: video.thumbnails,
+          duration: video.duration?.text,
+          views: video.view_count?.text,
+          published: video.published?.text
+        }));
+      }
+    } catch (e) {
+      console.warn(`[Warning] Could not fetch videos tab for ${channelId}:`, e.message);
+    }
+
+    let shortsData = [];
+    try {
+      const shortsTab = await channel.getShorts();
+      if (shortsTab && shortsTab.videos) {
+        shortsData = shortsTab.videos.map(short => ({
+          id: short.id,
+          title: short.title?.text,
+          thumbnail: short.thumbnails,
+          views: short.view_count?.text
+        }));
+      }
+    } catch (e) {
+      console.warn(`[Warning] Could not fetch shorts tab for ${channelId}:`, e.message);
+    }
+
+    let playlistsData = [];
+    try {
+      const playlistsTab = await channel.getPlaylists();
+      if (playlistsTab && playlistsTab.playlists) {
+        playlistsData = playlistsTab.playlists.map(playlist => ({
+          id: playlist.id,
+          title: playlist.title?.text,
+          video_count: playlist.video_count?.text,
+          thumbnail: playlist.thumbnails,
+          author: playlist.author?.name
+        }));
+      }
+    } catch (e) {
+      console.warn(`[Warning] Could not fetch playlists tab for ${channelId}:`, e.message);
+    }
+
+    let communityData = [];
+    try {
+      const communityTab = await channel.getCommunity();
+      if (communityTab && communityTab.posts) {
+        communityData = communityTab.posts.map(post => ({
+          id: post.id,
+          text: post.content?.text,
+          published: post.published?.text,
+          likes: post.vote_count || post.like_count?.text,
+          reply_count: post.reply_count?.text
+        }));
+      }
+    } catch (e) {
+      console.warn(`[Warning] Could not fetch community tab for ${channelId}:`, e.message);
+    }
+
+    const detailedInfo = {
+      id: channel.header?.author?.id || channelId,
+      name: channel.header?.author?.name,
+      handle: channel.header?.author?.handle?.text,
+      avatar: channel.header?.author?.thumbnails,
+      banner: channel.header?.banner?.thumbnails,
+      subscribers: channel.header?.subscriber_count?.text,
+      videos_count: channel.header?.videos_count?.text,
+      bio: channel.metadata?.description,
+      is_verified: channel.header?.author?.is_verified,
+      
+      latest_videos: videosData,
+      latest_shorts: shortsData,
+      playlists: playlistsData,
+      community_posts: communityData
+    };
+
+    res.json({
+      success: true,
+      data: detailedInfo
+    });
+
+  } catch (error) {
+    console.error(`Error fetching channel ${channelId}:`, error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch comprehensive channel information',
+      details: error.message
+    });
+  }
+});
+
+initYoutube().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+  });
+});
