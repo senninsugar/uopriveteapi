@@ -3,15 +3,9 @@ import cors from "cors";
 import { Agent as UndiciAgent } from "undici";
 import { Innertube } from "youtubei.js";
 
-/**
- * Expressアプリケーションの初期化
- */
 const app = express();
 const PORT = 3012;
 
-// ==========================================
-// YouTube Innertube 初期化 (統合版)
-// ==========================================
 let youtube;
 const youtubeReady = Innertube.create({
   lang: "ja",
@@ -27,27 +21,28 @@ const youtubeReady = Innertube.create({
     console.error("❌ Failed to initialize YouTube API:", err);
   });
 
-// ==========================================
-// CORS設定 (全オリジン許可)
-// ==========================================
-app.use(cors());
+// 追加ルート内の createYoutube() を解決するためのヘルパー関数
+async function createYoutube() {
+  await youtubeReady;
+  if (!youtube) {
+    throw new Error("YouTube API failed to initialize.");
+  }
+  return youtube;
+}
 
-// ==========================================
-// 定数・設定定義
-// ==========================================
+// 追加ルート内の applyChannelFilter() が未定義エラーにならないためのダミー・スタブ関数
+// (必要に応じて実際のフィルタリングロジックに置き換えてください)
+async function applyChannelFilter(videosFeed, sort) {
+  return videosFeed;
+}
+
+app.use(cors());
 
 const YOUTUBE_BASE_URL = "https://www.youtube.com/watch?v=";
 const YOUTUBE_API_URL = "https://www.youtube.com/youtubei/v1/next";
 
-/**
- * YouTube Innertube APIで使用する最新のAPIキー
- */
 const INNERTUBE_API_KEY = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw";
 
-/**
- * YouTubeへのリクエストで使用する最新のヘッダー設定
- * ※ Node.jsのfetchでエラーになる疑似ヘッダ(:authority等)は除外しています
- */
 const REQUEST_HEADERS = {
   "accept": "*/*",
   "accept-encoding": "gzip, deflate, br, zstd",
@@ -83,18 +78,11 @@ const REQUEST_HEADERS = {
   "x-client-data": "CIm2yQEIo7bJAQipncoBCIztygEIlaHLAQiIoM0BCNajzwEI1a3PAQi7rs8BCMevzwEIya/PAQj6r88BCLSwzwEInrHPAQifs88BCIW0zwEY7IXPAQ=="
 };
 
-// Keep-Alive 用の undici.Agent
 const undiciAgent = new UndiciAgent({
   connections: 16,
   keepAliveTimeout: 6000,
 });
 
-/**
- * サムネイル画像を Keep-Alive エージェント経由で取得し、base64 データURL を返します。
- * 失敗した場合は null を返します。
- * @param {string} url
- * @returns {Promise<string|null>}
- */
 const fetchImageAsBase64 = async (url) => {
   if (!url) return null;
   const controller = new AbortController();
@@ -122,9 +110,6 @@ const fetchImageAsBase64 = async (url) => {
   }
 };
 
-/**
- * APIリクエスト時に送信するクライアントコンテキスト
- */
 const CLIENT_CONTEXT = {
   client: {
     hl: "ja",
@@ -135,24 +120,10 @@ const CLIENT_CONTEXT = {
   },
 };
 
-// ==========================================
-// ユーティリティ関数
-// ==========================================
-
-/**
- * YouTubeのRunsオブジェクトからテキストを結合して抽出します。
- * @param {Array} runs - テキスト情報を含むオブジェクト配列
- * @returns {string|null} 結合されたテキスト、またはnull
- */
 const getTextFromRuns = (runs) => {
   return runs?.map((run) => run.text).join("") || null;
 };
 
-/**
- * 例外が発生する可能性のある関数を安全に実行します。
- * @param {Function} fn - 実行する関数
- * @returns {any|null} 実行結果、またはエラー時はnull
- */
 const safeGet = (fn) => {
   try {
     return fn();
@@ -161,17 +132,9 @@ const safeGet = (fn) => {
   }
 };
 
-/**
- * 動画アイテムのリストを解析し、統一されたフォーマットに正規化します。
- * LockupViewModel, CompactVideoRenderer, ContinuationItemRendererに対応しています。
- * 新旧のネスト構造(itemSectionRenderer)もここでフラット化して吸収します。
- * @param {Array} rawItems - APIからの生のアイテム配列
- * @returns {Array} 整形されたアイテム配列
- */
 const parseRawItems = (rawItems) => {
   if (!Array.isArray(rawItems)) return [];
 
-  // 新旧レスポンス対応: itemSectionRenderer でネストされている場合の中身を展開
   const flattenedItems = rawItems.reduce((acc, item) => {
     if (item?.itemSectionRenderer?.contents) {
       return acc.concat(item.itemSectionRenderer.contents);
@@ -182,18 +145,16 @@ const parseRawItems = (rawItems) => {
 
   return flattenedItems
     .map((item) => {
-      // A. LockupViewModel (新しいUI形式)
       if (item?.lockupViewModel) {
         return parseVideoLockup(item);
       }
-      // B. CompactVideoRenderer (従来のUI形式)
       if (item?.compactVideoRenderer) {
         const cvr = item.compactVideoRenderer;
         return {
           type: "compact_video",
           videoId: cvr.videoId,
           title: getTextFromRuns(cvr.title?.runs),
-          thumbnails: { static: cvr.thumbnail?.thumbnails }, // 構造維持
+          thumbnails: { static: cvr.thumbnail?.thumbnails },
           badge: {
             text: cvr.lengthText?.simpleText,
             icon: null,
@@ -210,7 +171,6 @@ const parseRawItems = (rawItems) => {
           },
         };
       }
-      // C. ContinuationItemRenderer (無限スクロール等の読み込みトリガー)
       if (item?.continuationItemRenderer) {
         const cir = item.continuationItemRenderer;
         const endpoint = cir.continuationEndpoint;
@@ -231,12 +191,6 @@ const parseRawItems = (rawItems) => {
     .filter(Boolean);
 };
 
-/**
- * 関連動画 (LockupViewModel形式) の構造を解析・整形します。
- * 詳細なメタデータ、サムネイル、バッジ情報を抽出します。
- * @param {Object} item - LockupViewModelを含むアイテム
- * @returns {Object|null} 整形された動画オブジェクト
- */
 const parseVideoLockup = (item) => {
   const lockup = item?.lockupViewModel;
   if (!lockup) return null;
@@ -301,7 +255,7 @@ const parseVideoLockup = (item) => {
       animated: animatedThumbnail || null,
     },
     badge: {
-      text: badgeText, // 再生時間
+      text: badgeText,
       icon: badgeIcon || null,
     },
     playlistId: playlistId || null,
@@ -322,11 +276,6 @@ const parseVideoLockup = (item) => {
   };
 };
 
-/**
- * YouTube Internal APIを使用して続きの動画データ（Continuation）を取得します。
- * @param {string} token - Continuationトークン
- * @returns {Promise<Object|null>} 取得したアイテムとターゲットIDを含むオブジェクト
- */
 const fetchContinuationData = async (token) => {
   if (!token) return null;
 
@@ -367,13 +316,6 @@ const fetchContinuationData = async (token) => {
   }
 };
 
-// ==========================================
-// 検索ルート専用のヘルパー関数群
-// ==========================================
-
-/**
- * サムネイルをBase64化して返す
- */
 async function generateThumbnails(videoId) {
   if (!videoId) return {};
   try {
@@ -391,9 +333,6 @@ async function generateThumbnails(videoId) {
   }
 }
 
-/**
- * 視聴回数のテキストを数値文字列に正規化
- */
 function normalizeViewCount(viewText) {
   if (typeof viewText !== "string") return "0";
 
@@ -409,9 +348,6 @@ function normalizeViewCount(viewText) {
   return viewText.replace(/[^\d]/g, "") || "0";
 }
 
-/**
- * 相対表記の投稿日時を日本語に整形
- */
 function formatPublishedAtJapanese(relativeText) {
   if (!relativeText) return "不明";
 
@@ -448,32 +384,18 @@ function formatPublishedAtJapanese(relativeText) {
   }
 }
 
-// ==========================================
-// API ルーティング
-// ==========================================
-
-/**
- * 動画詳細および関連動画を取得するエンドポイント
- */
 app.get("/api/video2/:id", async (req, res) => {
-  // パラメータがURLエンコードされている場合があるためデコードする
   let rawVideoId = req.params.id;
   try {
     rawVideoId = decodeURIComponent(rawVideoId);
   } catch (e) {
-    // デコード失敗時はそのまま
   }
   
   let videoId = rawVideoId;
 
-  // デフォルトパラメータ設定
   let continuationToken = req.query.token;
   let depth = null;
 
-  // ---------------------------------------------------------
-  // 独自パラメータ解析ロジック
-  // ID文字列に含まれるデリミタを使用してパラメータを抽出します
-  // ---------------------------------------------------------
   const checkParam = (key, val) => {
     if (key === "token") continuationToken = val;
     if (key === "depth") depth = val;
@@ -519,19 +441,14 @@ app.get("/api/video2/:id", async (req, res) => {
   }
 
   try {
-    // ---------------------------------------------------------
-    // パターンA: 継続トークンがある場合 (関連動画の追加読み込み)
-    // ---------------------------------------------------------
     if (continuationToken) {
       const result = await fetchContinuationData(continuationToken);
 
-      // 既存のAPI仕様に合わせてデータを変換
       const relatedVideosCompat =
         result?.items
           ?.map((item) => {
             if (item.type === "continuation") return null;
 
-            // IDが11文字ではない、かつ"RD"から始まる場合はメインの動画IDを使用する
             let rvId = item.videoId;
             if (rvId && rvId.length !== 11 && rvId.startsWith("RD")) {
               rvId = videoId;
@@ -547,18 +464,16 @@ app.get("/api/video2/:id", async (req, res) => {
               duration: item.badge?.text || null,
               badge: null,
               thumbnails: item.thumbnails?.static || [],
-              thumbnail: item.thumbnails?.static?.[0]?.url || null, // 一旦nullも許容
+              thumbnail: item.thumbnails?.static?.[0]?.url || null,
               channelAvatar: item.channel?.avatar || "",
               playlistId: item.playlistId,
             };
           })
           ?.filter(Boolean) || [];
 
-      // 次の読み込み用トークンを取得
       const nextToken =
         result?.items?.find((i) => i.type === "continuation")?.token || null;
 
-      // --- thumbnails[0] を base64 に変換（Keep-Alive エージェントを利用） ---
       try {
         await Promise.all(
           relatedVideosCompat.map(async (rv) => {
@@ -567,13 +482,11 @@ app.get("/api/video2/:id", async (req, res) => {
               b64 = await fetchImageAsBase64(rv.thumbnail);
             }
             
-            // サムネイルが取得できなかった場合のフォールバック
             if (!b64 && rv.videoId) {
               const fallbackUrl = `https://i.ytimg.com/vi_webp/${rv.videoId}/default.webp`;
               b64 = await fetchImageAsBase64(fallbackUrl);
             }
 
-            // b64データが取得できていればオブジェクトを更新
             if (b64) {
               if (Array.isArray(rv.thumbnails) && rv.thumbnails.length > 0) {
                 rv.thumbnails[0].url = b64;
@@ -593,7 +506,7 @@ app.get("/api/video2/:id", async (req, res) => {
 
       return res.json({
         id: videoId,
-        title: "", // 追加読み込みのためタイトルは不要
+        title: "",
         "Related-videos": {
           relatedCount: relatedVideosCompat.length,
           nextContinuationToken: nextToken,
@@ -602,9 +515,6 @@ app.get("/api/video2/:id", async (req, res) => {
       });
     }
 
-    // ---------------------------------------------------------
-    // パターンB: 通常の初回ロード (HTMLスクレイピング + 解析)
-    // ---------------------------------------------------------
     const targetUrl = `${YOUTUBE_BASE_URL}${videoId}`;
     const response = await fetch(targetUrl, {
       method: "GET",
@@ -621,7 +531,6 @@ app.get("/api/video2/:id", async (req, res) => {
     }
 
     const html = await response.text();
-    // HTML内から ytInitialData JSONオブジェクトを抽出
     const regex = /var ytInitialData\s*=\s*({.*?});/s;
     const match = html.match(regex);
 
@@ -642,7 +551,6 @@ app.get("/api/video2/:id", async (req, res) => {
         rawData.contents?.twoColumnWatchNextResults?.secondaryResults
           ?.secondaryResults;
 
-      // 1. 関連動画セクションの処理 (Secondary Results)
       let relatedVideos = [];
       let nextContinuationToken = null;
 
@@ -650,7 +558,6 @@ app.get("/api/video2/:id", async (req, res) => {
         const rawResults = secondarySection.results;
         let parsedResults = parseRawItems(rawResults);
 
-        // depthパラメータによる追加読み込みロジック
         if (depth == "2") {
           const continuationItem = parsedResults.find(
             (item) => item.type === "continuation"
@@ -671,7 +578,6 @@ app.get("/api/video2/:id", async (req, res) => {
           }
         }
 
-        // レスポンス用にデータを変換
         relatedVideos = parsedResults
           .map((item) => {
             if (item.type === "continuation") {
@@ -679,7 +585,6 @@ app.get("/api/video2/:id", async (req, res) => {
               return null;
             }
 
-            // IDが11文字ではない、かつ"RD"から始まる場合はメインの動画IDを使用する
             let rvId = item.videoId;
             if (rvId && rvId.length !== 11 && rvId.startsWith("RD")) {
               rvId = videoId;
@@ -703,7 +608,6 @@ app.get("/api/video2/:id", async (req, res) => {
           })
           .filter(Boolean);
 
-        // --- thumbnails[0] を base64 に変換（Keep-Alive エージェントを利用） ---
         try {
           await Promise.all(
             relatedVideos.map(async (rv) => {
@@ -712,13 +616,11 @@ app.get("/api/video2/:id", async (req, res) => {
                 b64 = await fetchImageAsBase64(rv.thumbnail);
               }
 
-              // サムネイルが取得できなかった場合のフォールバック
               if (!b64 && rv.videoId) {
                 const fallbackUrl = `https://i.ytimg.com/vi_webp/${rv.videoId}/default.webp`;
                 b64 = await fetchImageAsBase64(fallbackUrl);
               }
 
-              // b64データが取得できていればオブジェクトを更新
               if (b64) {
                 if (Array.isArray(rv.thumbnails) && rv.thumbnails.length > 0) {
                   rv.thumbnails[0].url = b64;
@@ -737,7 +639,6 @@ app.get("/api/video2/:id", async (req, res) => {
         }
       }
 
-      // 2. メイン動画情報の処理 (Primary Info)
       const primaryInfoRenderer = twoColumnResults?.contents?.find(
         (c) => c.videoPrimaryInfoRenderer
       )?.videoPrimaryInfoRenderer;
@@ -755,7 +656,6 @@ app.get("/api/video2/:id", async (req, res) => {
         });
       }
 
-      // メタデータの抽出
       const title = getTextFromRuns(primaryInfoRenderer?.title?.runs) || "";
       const shortViews =
         primaryInfoRenderer?.viewCount?.videoViewCountRenderer?.shortViewCount
@@ -769,7 +669,6 @@ app.get("/api/video2/:id", async (req, res) => {
         primaryInfoRenderer?.relativeDateText?.simpleText || "";
       const fullDate = primaryInfoRenderer?.dateText?.simpleText || "";
 
-      // 高評価情報の取得（ネストされた構造を安全に探索）
       const likeButtonTitle =
         safeGet(() => {
           const topLevelButtons =
@@ -781,7 +680,6 @@ app.get("/api/video2/:id", async (req, res) => {
             ?.defaultButtonViewModel?.buttonViewModel?.title;
         }) || "";
 
-      // 投稿者（チャンネル）情報の構築
       const ownerRenderer = secondaryInfoRenderer?.owner?.videoOwnerRenderer;
       const channelId =
         ownerRenderer?.title?.runs?.[0]?.navigationEndpoint?.browseEndpoint
@@ -790,7 +688,6 @@ app.get("/api/video2/:id", async (req, res) => {
       const subCount = ownerRenderer?.subscriberCountText?.simpleText || "";
       const authorThumb = ownerRenderer?.thumbnail?.thumbnails?.[0]?.url || "";
 
-      // コラボレーター情報の取得
       const collabHeadline = safeGet(
         () =>
           ownerRenderer?.navigationEndpoint?.showDialogCommand
@@ -818,11 +715,9 @@ app.get("/api/video2/:id", async (req, res) => {
             : [];
         }) || [];
 
-      // 概要欄の処理
       const descRaw =
         secondaryInfoRenderer?.attributedDescription?.content || "";
 
-      // テキストを行単位で分割し、空行を除外して整形
       const nonEmptyLines = descRaw
         .split(/\r?\n/)
         .filter((line) => line.trim() !== "");
@@ -830,20 +725,15 @@ app.get("/api/video2/:id", async (req, res) => {
       const descriptionObj = {
         text: descRaw,
         formatted: descRaw.replace(/\n/g, "<br>"),
-        // 最初の4行を抽出
         run0: nonEmptyLines[0] || "",
         run1: nonEmptyLines[1] || "",
         run2: nonEmptyLines[2] || "",
         run3: nonEmptyLines[3] || "",
       };
 
-      // メインのサムネイルURLの生成と Base64 化
       const mainThumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
       const mainThumbnailB64 = (await fetchImageAsBase64(mainThumbnailUrl)) || mainThumbnailUrl;
 
-      // ==========================================
-      // レスポンス用にAuthorデータを調整 (追加部分)
-      // ==========================================
       const isCollaborator = collaboratorsList.length > 0 || !!collabHeadline;
 
       let displayAuthorName = channelName;
@@ -851,15 +741,11 @@ app.get("/api/video2/:id", async (req, res) => {
       let displayAuthorSubscribers = subCount;
 
       if (isCollaborator && collaboratorsList.length > 0) {
-        // コラボレーターがいる場合、リストの最初の人をAuthor情報として使用
         displayAuthorName = collaboratorsList[0].name;
         displayAuthorThumbnail = collaboratorsList[0].thumbnail;
         displayAuthorSubscribers = "コラボレーター";
       }
 
-      // ==========================================
-      // コメント情報の取得
-      // ==========================================
       let commentData = { totalCommentCount: null, comments: [] };
       try {
         const commentSection = await youtube.getComments(videoId);
@@ -881,9 +767,6 @@ app.get("/api/video2/:id", async (req, res) => {
         console.warn("Comment fetch failed", e);
       }
 
-      // ---------------------------------------------------------
-      // レスポンスJSONの構築
-      // ---------------------------------------------------------
       res.json({
         id: videoId,
         title: title,
@@ -905,9 +788,8 @@ app.get("/api/video2/:id", async (req, res) => {
           nextContinuationToken: nextContinuationToken,
           relatedVideos: relatedVideos,
         },
-        comments: commentData, // 追加されたコメント情報
+        comments: commentData,
 
-        // 拡張統計情報
         extended_stats: {
           views_original: originalViews,
           views_short: shortViews,
@@ -934,9 +816,6 @@ app.get("/api/video2/:id", async (req, res) => {
   }
 });
 
-/**
- * 動画の検索結果を取得するエンドポイント (新規追加)
- */
 app.get("/api/search", async (req, res) => {
   await youtubeReady;
 
@@ -1006,9 +885,333 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-/**
- * ヘルスチェック用エンドポイント
- */
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
+
+app.get('/api/channel', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id, page = '1', sort } = req.query; 
+    if (!id) return res.status(400).json({ error: "Missing channel id" });
+
+    const channel = await youtube.getChannel(id);
+    let videosFeed = await channel.getVideos();
+    videosFeed = await applyChannelFilter(videosFeed, sort);
+
+    let videosToReturn = videosFeed.videos || [];
+    const targetPage = parseInt(page);
+    
+    if (targetPage > 1) {
+        for (let i = 1; i < targetPage; i++) {
+            if (videosFeed.has_continuation) {
+                videosFeed = await videosFeed.getContinuation();
+                videosToReturn = videosFeed.videos || [];
+            } else {
+                videosToReturn = [];
+                break;
+            }
+        }
+    }
+    
+    const title = channel.metadata?.title || channel.header?.title?.text || channel.header?.author?.name || null;
+    let avatar = channel.metadata?.avatar || channel.header?.avatar || channel.header?.author?.thumbnails || null;
+    if (Array.isArray(avatar) && avatar.length > 0) avatar = avatar[0].url;
+    else if (typeof avatar === 'object' && avatar?.url) avatar = avatar.url;
+
+    let banner = channel.metadata?.banner || channel.header?.banner || null;
+    if (Array.isArray(banner) && banner.length > 0) banner = banner[0].url;
+    else if (typeof banner === 'object' && banner?.url) banner = banner.url;
+    else if (typeof banner !== 'string') banner = null; 
+
+    res.status(200).json({
+      channel: {
+        id: channel.id, 
+        name: title, 
+        description: channel.metadata?.description || null,
+        avatar: avatar, 
+        banner: banner,
+        subscriberCount: channel.metadata?.subscriber_count?.pretty || '非公開', 
+        videoCount: channel.metadata?.videos_count?.text ?? channel.metadata?.videos_count ?? '0'
+      },
+      page: targetPage, 
+      videos: videosToReturn,
+      nextPageToken: videosFeed.has_continuation ? String(targetPage + 1) : undefined
+    });
+  } catch (err) { 
+      res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/channel-shorts', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing channel id" });
+    const channel = await youtube.getChannel(id);
+    const shortsFeed = await channel.getShorts();
+    let shorts = [];
+    if (shortsFeed.videos) {
+        shorts = shortsFeed.videos;
+    } else if (shortsFeed.contents && Array.isArray(shortsFeed.contents)) {
+        const tabContent = shortsFeed.contents[0];
+        if (tabContent && tabContent.contents) shorts = tabContent.contents;
+    }
+    res.status(200).json(shorts);
+  } catch (err) { 
+      res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/channel-live', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing channel id" });
+    const channel = await youtube.getChannel(id);
+    const liveFeed = await channel.getLiveStreams();
+    res.status(200).json({ videos: liveFeed.videos || [] });
+  } catch (err) {
+      res.status(200).json({ videos: [] });
+  }
+});
+
+app.get('/api/channel-community', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing channel id" });
+    const channel = await youtube.getChannel(id);
+    const community = await channel.getCommunity();
+    const posts = community.posts?.map(post => ({
+        id: post.id,
+        text: post.content?.text || "",
+        publishedTime: post.published.text,
+        likeCount: post.vote_count?.text || "0",
+        author: { name: post.author.name, avatar: post.author.thumbnails[0]?.url },
+        attachment: post.attachment ? {
+            type: post.attachment.type,
+            images: post.attachment.images?.map(i => i.url),
+            choices: post.attachment.choices?.map(c => c.text.text),
+            videoId: post.attachment.video?.id
+        } : null
+    })) || [];
+    res.status(200).json({ posts });
+  } catch (err) {
+      res.status(200).json({ posts: [] });
+  }
+});
+
+app.get('/api/channel-playlists', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing channel id" });
+    const channel = await youtube.getChannel(id);
+    const playlistsFeed = await channel.getPlaylists();
+    let playlists = playlistsFeed.playlists || playlistsFeed.items || [];
+    if (playlists.length === 0 && playlistsFeed.contents && Array.isArray(playlistsFeed.contents)) {
+        const tabContent = playlistsFeed.contents[0];
+        if (tabContent && tabContent.contents) playlists = tabContent.contents;
+    }
+    res.status(200).json({ playlists });
+  } catch (err) { 
+      res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/playlist', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    const playlist = await youtube.getPlaylist(id);
+    if (!playlist.info?.id) return res.status(404).json({ error: "Playlist not found"});
+    res.status(200).json(playlist);
+  } catch (err) { 
+      res.status(500).json({ error: err.message }); 
+  }
+});
+
+app.get('/api/fvideo', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const homeFeed = await youtube.getHomeFeed();
+    res.status(200).json({ videos: homeFeed.videos || homeFeed.items || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -------------------------------------------------------------------
+// 🌟 ここから下が今回追加した youtubei.js の新機能群 🌟
+// -------------------------------------------------------------------
+
+// 1. 急上昇（トレンド）の取得
+app.get('/api/trending', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const trending = await youtube.getTrending();
+    res.status(200).json({
+      videos: trending.videos || [],
+      categories: trending.categories || []
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. 探索・ガイド（Explore）の取得
+app.get('/api/explore', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const explore = await youtube.getExplore();
+    res.status(200).json(explore);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. ハッシュタグ検索（例: /api/hashtag?tag=マイクラ）
+app.get('/api/hashtag', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { tag } = req.query;
+    if (!tag) return res.status(400).json({ error: "Missing tag query" });
+    
+    const hashtagFeed = await youtube.getHashtag(tag);
+    res.status(200).json({
+      header: hashtagFeed.header,
+      videos: hashtagFeed.videos || []
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. 動画の字幕（文字起こし）取得
+app.get('/api/transcript', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing video id" });
+
+    const info = await youtube.getInfo(id);
+    const transcriptInfo = await info.getTranscript();
+    
+    const segments = transcriptInfo?.transcript?.content?.body?.initial_segments?.map(seg => ({
+      text: seg.snippet?.text,
+      startTime: seg.start_ms,
+      endTime: seg.end_ms
+    })) || [];
+
+    res.status(200).json({ segments });
+  } catch (err) {
+    res.status(500).json({ error: "Transcript not available or " + err.message });
+  }
+});
+
+// 5. URLの解決 (URLから動画IDやチャンネルIDなどを特定)
+app.get('/api/resolve', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: "Missing url" });
+
+    const result = await youtube.resolveURL(url);
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- YouTube Music 機能群 (非常に安定しています) ---
+
+// 6. Music 検索
+app.get('/api/music/search', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { q, filter } = req.query; 
+    if (!q) return res.status(400).json({ error: "Missing query" });
+
+    const searchResult = await youtube.music.search(q, { type: filter });
+    res.status(200).json(searchResult);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Music 楽曲の詳細（ストリーミング情報など）
+app.get('/api/music/track', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing track id" });
+
+    const trackInfo = await youtube.music.getInfo(id);
+    res.status(200).json(trackInfo);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Music 歌詞の取得
+app.get('/api/music/lyrics', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing track id" });
+
+    const lyrics = await youtube.music.getLyrics(id);
+    res.status(200).json({
+       text: lyrics?.text || "No lyrics available",
+       footer: lyrics?.footer
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 9. Music アーティスト情報の取得
+app.get('/api/music/artist', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing artist id" });
+
+    const artist = await youtube.music.getArtist(id);
+    res.status(200).json(artist);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 10. Music プレイリスト・アルバムの取得
+app.get('/api/music/playlist', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing playlist/album id" });
+
+    const playlist = await youtube.music.getPlaylist(id);
+    res.status(200).json(playlist);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. Music 「次に再生（Up Next / ラジオ）」の取得
+app.get('/api/music/upnext', async (req, res) => {
+  try {
+    const youtube = await createYoutube();
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: "Missing track id" });
+
+    const upNext = await youtube.music.getUpNext(id);
+    res.status(200).json(upNext);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// サーバー起動 (ポート番号は元の3012を使用)
+app.listen(PORT, () => console.log(`Server ready on port ${PORT}.`));
